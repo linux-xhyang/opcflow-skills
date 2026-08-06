@@ -1,0 +1,4 @@
+interface:
+  display_name: "opcflow 依赖体检"
+  short_description: "检查 opcflow 技能栈的 CLI 工具、脚本和配置可用性"
+  default_prompt: "Run opc_doctor.py to check opcflow skill dependencies. Report status and missing tools."

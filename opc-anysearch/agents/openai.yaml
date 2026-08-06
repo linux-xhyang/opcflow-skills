@@ -1,0 +1,4 @@
+interface:
+  display_name: "AnySearch 公共网页搜索"
+  short_description: "匿名的公共网页搜索后端，支持关键词检索、垂直领域发现、批量搜索与原文核验"
+  default_prompt: "Use AnySearch CLI for public web search, batch queries, vertical domain discovery, and candidate verification."
