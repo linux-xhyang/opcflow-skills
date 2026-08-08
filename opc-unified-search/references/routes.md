@@ -40,8 +40,8 @@ opencli doctor  # 仅 OpenCLI 路线需要
 |---|---|---|---|
 | GitHub 仓库/代码/Issue/PR | `gh search ...` | 公共数据先匿名；需要更高额度时再由用户登录 | 只搜索，不 clone、不改仓库 |
 | 微信公众号跨号关键词 | `opencli weixin search` | 匿名公共搜狗微信路线 | 绝不操控微信 UI；不进后台 |
-| 小红书站内关键词 | `opencli xiaohongshu search` | 必须取得当轮 Chrome 登录态授权 | 只返回候选；不下载、不展开评论 |
-| 抖音站内关键词 | `opencli douyin search` | 必须取得当轮 Chrome 登录态授权 | 低频串行；不下载、不展开评论 |
+| 小红书站内关键词 | `opencli xiaohongshu search` | 必须取得当轮 Chrome 登录态授权 | 返回候选；评论获取见评论章节 |
+| 抖音站内关键词 | `opencli douyin search` | 必须取得当轮 Chrome 登录态授权 | 低频串行；评论获取见评论章节 |
 | 今日头条综合非视频 | `opencli toutiao search` | 专用匿名 profile，不读取用户 Chrome | 单关键词、低频、无自动重试 |
 | Twitter/X 公共搜索 | `$yichen-grok-consult` → 仅额度耗尽时 `fxtwitter_search.py` → OpenCLI → xreach | Grok CLI 使用账号 OAuth；FxTwitter 匿名；后续浏览器会话回退按工具授权 | 所有关键词搜索先走 Grok 原生 `x_search`；只有明确额度或使用上限耗尽才能进入 FxTwitter |
 | B站公开视频 | `bili search` | 匿名优先 | 只生成候选 URL，不下载 |
@@ -61,8 +61,8 @@ gh search prs "query" --limit 10
 opencli weixin search "query" --page 1 --limit 10
 
 # 小红书/抖音：执行前取得本次关键词和条数的明确授权
-opencli xiaohongshu search "query" --days 1 --content all --limit 20 --enrich -f yaml
-opencli douyin search "query" --days 1 --content all --limit 30 --enrich -f yaml
+opencli xiaohongshu search "query" --limit 10 -f yaml
+opencli douyin search "query" --limit 10 -f yaml
 
 # 今日头条：只保留文章和非视频图文帖
 opencli toutiao search "query" --days 1 --limit 20 -f yaml
@@ -97,3 +97,69 @@ yt-dlp --flat-playlist --dump-single-json "ytsearch20:query"
 - FxTwitter 返回普通推文、引用推文和 Article 候选时，保留引用对象与 Article 标题、预览和封面元数据；搜索阶段不得展开 Article 全文。全文读取仍交给 `$opc-content-archive`。
 - `$yichen-grok-consult` 当前不可调用时，只报告主链不可用；不要自动安装插件，也不要绕过固定四层链另找账号后端。
 - 任何验证码、登录墙、权限错误或账号安全提示都应停止，不尝试绕过或自动重试。
+
+## 评论获取
+
+当用户需要对搜索结果中的笔记/视频获取评论时，按以下方式执行：
+
+### 小红书评论
+
+`opencli xiaohongshu` 提供原生 `comments` 命令，直接传入搜索结果中的完整 URL（含 `xsec_token`）即可：
+
+```bash
+opencli xiaohongshu comments "<full-note-url-with-xsec-token>" --limit 20 -f json
+```
+
+参数：
+- `--limit`：顶层评论数（最大 50，默认 20）
+- `--with-replies`：是否包含楼中楼子回复（默认 false）
+- note-id 参数必须是搜索结果返回的完整 URL（含 `xsec_token`），不支持仅 note-id
+
+输出字段：`rank, author, userId, profileUrl, text, likes, time, is_reply, reply_to`
+
+### 抖音评论
+
+`opencli douyin` **没有**直接的 `comments` 命令。获取评论有两种方式：
+
+**方式一：user-videos（仅限用户近期视频）**
+
+```bash
+opencli douyin user-videos "<sec_uid>" --with_comments true --comment_limit 10 -f json
+```
+
+限制：
+- 仅返回最近 ~20 条视频的热门评论
+- 需要先获取作者的 `sec_uid`（搜索结果不包含此字段）
+- 获取 sec_uid 的方法：用 `opencli browser <session> open <video-url>` 打开视频页 → `eval` 从 DOM 的 `<a href="/user/<sec_uid>">` 中提取
+
+**方式二：浏览器 API 直调（推荐，支持任意视频）**
+
+```bash
+# 打开视频页面
+opencli browser <session> open "https://www.douyin.com/video/<aweme_id>" --window background
+
+# 等待页面加载后，通过 fetch 调用评论 API
+opencli browser <session> eval "
+(async () => {
+  const url = 'https://www.douyin.com/aweme/v1/web/comment/list/?aweme_id=<aweme_id>&count=20&cursor=0&aid=6383';
+  const resp = await fetch(url, {credentials: 'include'});
+  return JSON.stringify(await resp.json());
+})()"
+
+# 翻页：修改 cursor 参数，从响应的 has_more 判断是否还有更多
+opencli browser <session> eval "...&cursor=20..."
+
+# 完成后关闭会话
+opencli browser <session> close
+```
+
+API 端点：`https://www.douyin.com/aweme/v1/web/comment/list/`
+参数：`aweme_id`（视频 ID）、`count`（每页条数，最大 20）、`cursor`（偏移量）、`aid=6383`
+
+返回字段：`comments[].text, comments[].digg_count, comments[].user.nickname, comments[].user.sec_uid, comments[].create_time` 及 `has_more`
+
+重要限制：
+- 必须使用 Chrome 登录态（`credentials: 'include'`），评论 API 需要登录 Cookie
+- 每页最多 20 条，通过 `cursor` 翻页，`has_more: 1` 表示还有更多
+- 评论顺序由平台决定，非严格按热度或时间排序
+- `opencli browser` 命令用于承载浏览器会话，`open` 建立页面，`eval` 注入 JS，`close` 释放会话

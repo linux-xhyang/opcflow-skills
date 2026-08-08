@@ -5,6 +5,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SKILL = ROOT / "SKILL.md"
+ROUTES = ROOT / "references" / "routes.md"
 
 
 class StaticContractTests(unittest.TestCase):
@@ -69,6 +70,42 @@ class StaticContractTests(unittest.TestCase):
         router = (ROOT / "scripts" / "route_search.py").read_text(encoding="utf-8")
         self.assertNotIn('choices=("search", "batch", "extract")', router)
         self.assertIn("verify-candidate", router)
+
+    # ── 评论获取文档合约 ──
+
+    def test_routes_md_has_comment_section(self):
+        text = ROUTES.read_text(encoding="utf-8")
+        self.assertIn("## 评论获取", text)
+
+    def test_routes_md_documents_xiaohongshu_comments_command(self):
+        text = ROUTES.read_text(encoding="utf-8")
+        self.assertIn("opencli xiaohongshu comments", text)
+        self.assertIn("xsec_token", text)
+        self.assertIn("--with-replies", text)
+
+    def test_routes_md_documents_douyin_comment_api(self):
+        text = ROUTES.read_text(encoding="utf-8")
+        self.assertIn("aweme/v1/web/comment/list/", text)
+        self.assertIn("cursor", text)
+        self.assertIn("has_more", text)
+
+    def test_routes_md_documents_douyin_comment_workaround(self):
+        text = ROUTES.read_text(encoding="utf-8")
+        self.assertIn("opencli douyin", text)
+        self.assertIn("user-videos", text)
+        self.assertIn("opencli browser", text)
+        self.assertIn("没有", text)  # douyin has no direct comments command
+
+    def test_xiaohongshu_douyin_command_shapes_have_no_removed_flags(self):
+        text = ROUTES.read_text(encoding="utf-8")
+        shapes_section = text.split("### 命令形状")[1].split("## 选择细则")[0]
+        self.assertIn("opencli xiaohongshu search", shapes_section)
+        self.assertIn("opencli douyin search", shapes_section)
+        for line in shapes_section.splitlines():
+            if "xiaohongshu search" in line or "douyin search" in line:
+                for removed in ("--days", "--content", "--enrich"):
+                    with self.subTest(removed=removed, line=line.strip()):
+                        self.assertNotIn(removed, line)
 
 
 if __name__ == "__main__":

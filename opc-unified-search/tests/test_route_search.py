@@ -199,6 +199,50 @@ class RouteTests(unittest.TestCase):
             result["steps"][1]["argv"], ["https://example.com/article"]
         )
 
+    # ── 命令形状回归：opencli 不再支持 --days / --content / --enrich ──
+
+    def test_xiaohongshu_native_command_has_no_removed_flags(self):
+        result = ROUTER.plan(request(platform="xiaohongshu", login_approved=True))
+        self.assertEqual(result["status"], "ready")
+        argv = result["steps"][0]["argv"]
+        for removed in ("--days", "--content", "--enrich"):
+            with self.subTest(removed=removed):
+                self.assertNotIn(removed, argv)
+        self.assertIn("--limit", argv)
+        self.assertIn("yaml", argv)
+
+    def test_douyin_native_command_has_no_removed_flags(self):
+        result = ROUTER.plan(request(platform="douyin", login_approved=True))
+        self.assertEqual(result["status"], "ready")
+        argv = result["steps"][0]["argv"]
+        for removed in ("--days", "--content", "--enrich"):
+            with self.subTest(removed=removed):
+                self.assertNotIn(removed, argv)
+        self.assertIn("--limit", argv)
+        self.assertIn("yaml", argv)
+
+    def test_xiaohongshu_days_emits_limitation(self):
+        result = ROUTER.plan(
+            request(platform="xiaohongshu", login_approved=True, days=7)
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["limitations"])
+        self.assertTrue(
+            any("--days" in lim for lim in result["limitations"]),
+            f"Expected --days limitation, got: {result['limitations']}",
+        )
+
+    def test_douyin_days_emits_limitation(self):
+        result = ROUTER.plan(
+            request(platform="douyin", login_approved=True, days=1)
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["limitations"])
+        self.assertTrue(
+            any("--days" in lim for lim in result["limitations"]),
+            f"Expected --days limitation, got: {result['limitations']}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

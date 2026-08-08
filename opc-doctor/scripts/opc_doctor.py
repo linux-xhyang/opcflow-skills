@@ -112,6 +112,30 @@ class ConfigCheck(Check):
         return {"status": "ok", "message": f"{self.relpath} 配置完整", "path": str(path)}
 
 
+class PyModuleCheck(Check):
+    """Check if a Python module is importable by spawning an interpreter subprocess."""
+
+    def __init__(self, module: str, label: str, install: str = "", skill: str | None = None) -> None:
+        super().__init__(f"pymod:{module}", label, install, skill)
+        self.module = module
+
+    def run(self) -> dict:
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", f"import {self.module}"],
+                check=False, text=True, capture_output=True, timeout=15,
+            )
+            if proc.returncode == 0:
+                return {"status": "ok", "message": f"{self.module} 可导入"}
+            return {
+                "status": "error",
+                "message": f"{self.module} 未安装 ({proc.stderr.strip()})",
+                "install_hint": self.install,
+            }
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"status": "error", "message": f"检查 {self.module} 失败: {exc}", "install_hint": self.install}
+
+
 class EnvCheck(Check):
     def __init__(self, var: str, label: str, install: str = "") -> None:
         super().__init__(f"env:{var}", label, install, None)
@@ -136,6 +160,9 @@ CHECKS: list[Check] = [
     WhichCheck("grok", "Grok CLI", "安装 Grok CLI 并完成 OAuth 登录", skill="unified-search"),
     WhichCheck("xreach", "xreach", "需要安装 xreach read-only GraphQL 客户端", skill="unified-search"),
     WhichCheck("ffmpeg", "FFmpeg", "brew install ffmpeg 或 apt install ffmpeg", skill="content-archive", verify=("-version",)),
+
+    # Python modules
+    PyModuleCheck("playwright", "Playwright Python 模块", "pip install playwright && python3 -m playwright install chromium", skill="content-archive"),
 
     # Scripts — unified-search
     ScriptCheck("scripts/route_search.py", "离线路由器", "unified-search"),

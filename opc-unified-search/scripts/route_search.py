@@ -215,13 +215,8 @@ def native_steps(platform: str, request: Request) -> list[dict]:
             "xiaohongshu",
             "search",
             query,
-            "--days",
-            str(days),
-            "--content",
-            "all",
             "--limit",
             str(min(limit, 30)),
-            "--enrich",
             "-f",
             "yaml",
         ],
@@ -230,13 +225,8 @@ def native_steps(platform: str, request: Request) -> list[dict]:
             "douyin",
             "search",
             query,
-            "--days",
-            str(days),
-            "--content",
-            "all",
             "--limit",
             str(min(limit, 30)),
-            "--enrich",
             "-f",
             "yaml",
         ],
@@ -452,6 +442,11 @@ def plan(request: Request) -> dict:
 
     if platform == "toutiao":
         limitations.append("Single keyword, low frequency, current public non-video results only.")
+    if platform in {"xiaohongshu", "douyin"} and request.days is not None:
+        limitations.append(
+            "opencli xiaohongshu/douyin search does not support --days; "
+            "date filtering is not forwarded to the native command."
+        )
     if platform == "x":
         limitations.extend(
             [
