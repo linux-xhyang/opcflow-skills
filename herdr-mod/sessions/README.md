@@ -48,3 +48,10 @@ herdr-app check ~/.config/herdr-app/mods/sessions          # 验证
 - 依赖 python3（PATH 中可用）
 - codex/grok 的 resume id 按文件名推断（best-effort），如 CLI 版本不接受可自行改 `CLI_META` 里的命令
 - 会话标题只在文件头部 128KB 内找；超长会话若首条消息在更深处会退化为文件名
+
+## 已知坑（herdr-app 0.1.x 排查记录）
+
+1. **exec 传绝对路径脚本参数会吞 stdout**：`exec("python3", [script])` 进程正常退出但 stdout 为空；必须用 `exec("sh", ["-c", 'python3 "$1"', "sessions", path])` 包装（files mod 同款模式）。
+2. **多实例元素 id 冲突**：弹窗实例与侧边面板实例共存时，相同 `.id()` 会导致行画不出来。根节点 id 须实例唯一（`Date.now()`），行元素不要加 id。
+3. **弹窗首帧布局不完整**：挂载瞬间渲染的行可能不显示（普通 div 正常），需要一次后续 re-render。init 里 `cx.sleep(600)` 后补一次 `cx.notify()` 解决；列表容器不要用 `.gap()`。
+4. **gpui 色值没有 `transparent`**：用 `#00000000` 或与背景同色的 theme token。

@@ -42,6 +42,7 @@ export default class Sessions extends View {
   init(_props, cx) {
     this.query = TextareaState.new({ placeholder: "搜索标题 / 项目路径", rows: 1 });
     this.query.on("change", (_e, cx) => cx.notify());
+    this.uid = `sessions-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
     this.cli = "all";
     this.sessions = [];
     this.loading = false;
@@ -53,6 +54,11 @@ export default class Sessions extends View {
     cx.timer.every(10000, (cx) => {
       this.refresh(cx);
       this.refreshCurrent(cx);
+    });
+    // 弹窗挂载的首帧布局可能不完整（行画不出来），稍后补一次重渲染
+    cx.spawn(async (cx) => {
+      await cx.sleep(600);
+      cx.notify();
     });
   }
 
@@ -214,8 +220,31 @@ export default class Sessions extends View {
   row(s, t) {
     const meta = CLI_META[s.cli] ?? { label: s.cli };
     const isCurrent = this.currentKey === `${s.cli}:${s.id}`;
+    const kids = [
+      div().w(3).h(22).rounded(2).flex_none().bg(isCurrent ? t.accent : t.surface),
+      div()
+        .px(7)
+        .h(20)
+        .rounded(5)
+        .text_size(11)
+        .items_center()
+        .flex_none()
+        .bg(t.raised)
+        .border_1()
+        .border_color(t.border)
+        .text_color(t.muted)
+        .child(meta.label),
+      v_flex()
+        .flex_1()
+        .min_w(0)
+        .gap(2)
+        .child(div().truncate().font_semibold().child(s.title.replace(/\n/g, " ")))
+        .child(div().truncate().text_size(11).text_color(t.dim).child(s.cwd || "—")),
+      div().text_size(11).text_color(t.dim).flex_none().w(58).text_right().child(fmtTime(s.mtime)),
+    ];
+    if (meta.resume) kids.push(this.btn("恢复", t, (cx) => this.resume(s, cx)));
+    kids.push(this.btn("打开", t, (cx) => this.openFolder(s, cx)));
     return h_flex()
-      .id(`sess-${s.cli}-${s.id}`)
       .h(46)
       .flex_none()
       .px(8)
@@ -224,57 +253,24 @@ export default class Sessions extends View {
       .rounded(8)
       .cursor_pointer()
       .bg(isCurrent ? t.selected : t.surface)
-      .child(div().w(3).h(22).rounded(2).flex_none().bg(isCurrent ? t.accent : t.surface))
-      .child(
-        div()
-          .px(7)
-          .h(20)
-          .rounded(5)
-          .text_size(11)
-          .items_center()
-          .flex_none()
-          .bg(t.raised)
-          .border_1()
-          .border_color(t.border)
-          .text_color(t.muted)
-          .child(meta.label),
-      )
-      .child(
-        v_flex()
-          .flex_1()
-          .min_w(0)
-          .gap(2)
-          .child(div().truncate().font_semibold().child(s.title.replace(/\n/g, " ")))
-          .child(div().truncate().text_size(11).text_color(t.dim).child(s.cwd || "—")),
-      )
-      .child(div().text_size(11).text_color(t.dim).flex_none().w(58).text_right().child(fmtTime(s.mtime)))
-      .when(Boolean(meta.resume), (el) => el.child(this.btn("恢复", t, (cx) => this.resume(s, cx))))
-      .child(this.btn("打开", t, (cx) => this.openFolder(s, cx)))
+      .children(kids)
       .on_click((_e, cx) => {
         if (CLI_META[s.cli]?.resume) this.resume(s, cx);
       });
   }
 
   footer(t) {
-    return h_flex()
-      .px(12)
-      .py(8)
-      .border_t(1)
-      .border_color(t.border)
-      .gap(8)
-      .items_center()
-      .child(
-        div()
-          .text_size(11)
-          .text_color(t.dim)
-          .child(
-            `${this.sessions.length} 个会话` +
-              (this.updated ? ` · 更新于 ${fmtTime(Math.floor(this.updated / 1000))}` : ""),
-          ),
-      )
-      .when(Boolean(this.currentKey), (el) =>
-        el.child(div().text_size(11).text_color(t.accent).child("● 当前 tab 的会话已高亮")),
-      );
+    const kids = [
+      div()
+        .text_size(11)
+        .text_color(t.dim)
+        .child(
+          `${this.sessions.length} 个会话` +
+            (this.updated ? ` · 更新于 ${fmtTime(Math.floor(this.updated / 1000))}` : ""),
+        ),
+    ];
+    if (this.currentKey) kids.push(div().text_size(11).text_color(t.accent).child("● 当前 tab 的会话已高亮"));
+    return h_flex().px(12).py(8).border_t(1).border_color(t.border).gap(8).items_center().children(kids);
   }
 
   render(cx) {
@@ -284,7 +280,7 @@ export default class Sessions extends View {
     const t = theme();
     const rows = this.filtered();
     return v_flex()
-      .id("sessions")
+      .id(this.uid)
       .size_full()
       .min_h(0)
       .bg(t.surface)
@@ -297,16 +293,18 @@ export default class Sessions extends View {
           .min_h(0)
           .overflow_y_scrollbar()
           .p(6)
-          .gap(4)
-          .when(this.error, (el) =>
-            el.child(div().p(8).text_size(12).text_color(t.muted).child(`加载失败：${this.error}`)),
-          )
-          .when(!this.error && !rows.length, (el) =>
-            el
-              .child(div().p(8).text_size(12).text_color(t.dim).child(this.loading ? "加载会话历史…" : "没有找到会话"))
-              .child(div().p(8).text_size(11).text_color(t.dim).child("需要 python3；只列出最近 90 天的会话")),
-          )
-          .children(rows.map((s) => this.row(s, t))),
+          .children([
+            ...(this.error
+              ? [div().p(8).text_size(12).text_color(t.muted).child(`加载失败：${this.error}`)]
+              : []),
+            ...(!this.error && !rows.length
+              ? [
+                  div().p(8).text_size(12).text_color(t.dim).child(this.loading ? "加载会话历史…" : "没有找到会话"),
+                  div().p(8).text_size(11).text_color(t.dim).child("需要 python3；只列出最近 90 天的会话"),
+                ]
+              : []),
+            ...rows.map((s) => this.row(s, t)),
+          ]),
       )
       .child(this.footer(t));
   }
