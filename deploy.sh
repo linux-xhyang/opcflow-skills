@@ -5,8 +5,9 @@
 #   1. skills/           软链接到通用 skill 目录（默认 ~/.agents/skills，
 #                        可被任意 agent 读取，不绑定特定工具）
 #   2. 通用目录中的 skill 桥接到 ~/.claude/skills，供 Claude Code 加载
-#   3. herdr-mod/*        软链接到 herdr-app 的 mods 目录
-#   4. config/herdr-core 复制到 herdr-core 配置目录
+#   3. config/herdr-mod/* 软链接到 herdr-app 的 mods 目录
+#   4. config/herdr-app  增量合并到 herdr-app 配置目录
+#   5. config/herdr-core 复制到 herdr-core 配置目录
 #                        默认: ${XDG_CONFIG_HOME:-~/.config}/herdr-core
 
 set -euo pipefail
@@ -27,10 +28,13 @@ usage() {
   2. Claude 桥接         通用目录中的 skill 软链接到 ~/.claude/skills，
                          供 Claude Code 加载；--no-claude 可跳过
                          覆盖: 环境变量 CLAUDE_SKILLS_DIR
-  3. herdr-mod/*        软链接到 herdr-app 的 mods 目录
+  3. config/herdr-mod/* 软链接到 herdr-app 的 mods 目录
                          默认: ~/.config/herdr-app/mods
                          覆盖: 环境变量 HERDR_MODS_DIR
-  4. config/herdr-core  复制到 herdr-core 配置目录
+  4. config/herdr-app   增量合并 herdr-app 快捷键配置
+                         默认: ~/.config/herdr-app/keys.json
+                         覆盖: 环境变量 HERDR_APP_HOME / HERDR_KEYS_FILE
+  5. config/herdr-core  复制到 herdr-core 配置目录
                          默认: \${XDG_CONFIG_HOME:-~/.config}/herdr-core
                          覆盖: 环境变量 HERDR_CONFIG_DIR
 
@@ -50,15 +54,18 @@ esac
 
 REPO_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILLS_SRC="$REPO_DIR/skills"
-MODS_SRC="$REPO_DIR/herdr-mod"
+MODS_SRC="$REPO_DIR/config/herdr-mod"
+HERDR_APP_SRC="$REPO_DIR/config/herdr-app"
 HERDR_SRC="$REPO_DIR/config/herdr-core"
 
 # 通用 skill 目录（不绑定具体 agent 工具）
 SKILLS_DST="${SKILLS_DIR:-$HOME/.agents/skills}"
 # Claude Code 桥接目录（指向通用目录，便于 Claude Code 加载）
 CLAUDE_DST="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
-# herdr-app mods 目录
-MODS_DST="${HERDR_MODS_DIR:-$HOME/.config/herdr-app/mods}"
+# herdr-app 配置与 mods 目录
+HERDR_APP_DST="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
+MODS_DST="${HERDR_MODS_DIR:-$HERDR_APP_DST/mods}"
+HERDR_KEYS_DST="${HERDR_KEYS_FILE:-$HERDR_APP_DST/keys.json}"
 # herdr-core 配置目录
 HERDR_DST="${HERDR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-core}"
 
@@ -115,7 +122,7 @@ deploy_to_dir() {
 
 # ---------------------------------------------------------------- skills
 deploy_skills() {
-  step "1/4 部署 skills 到通用 skill 目录（软链接）"
+  step "1/5 部署 skills 到通用 skill 目录（软链接）"
   printf '    源:   %s\n    目标: %s\n' "$SKILLS_SRC" "$SKILLS_DST"
 
   [ -d "$SKILLS_SRC" ] || { warn "未找到 skills 目录，跳过"; return; }
@@ -132,7 +139,7 @@ deploy_skills() {
 
 # ---------------------------------------------------------------- claude 桥接
 deploy_claude_bridge() {
-  step "2/4 桥接通用 skill 到 Claude Code（软链接）"
+  step "2/5 桥接通用 skill 到 Claude Code（软链接）"
   printf '    源:   %s\n    目标: %s\n' "$SKILLS_DST" "$CLAUDE_DST"
 
   [ "$NO_CLAUDE" -eq 1 ] && { skip_ "已用 --no-claude 跳过"; return; }
@@ -147,10 +154,10 @@ deploy_claude_bridge() {
 
 # ---------------------------------------------------------------- herdr mods
 deploy_mods() {
-  step "3/4 部署 herdr mods 到 herdr-app（软链接）"
+  step "3/5 部署 herdr mods 到 herdr-app（软链接）"
   printf '    源:   %s\n    目标: %s\n' "$MODS_SRC" "$MODS_DST"
 
-  [ -d "$MODS_SRC" ] || { warn "未找到 herdr-mod 目录，跳过"; return; }
+  [ -d "$MODS_SRC" ] || { warn "未找到 config/herdr-mod 目录，跳过"; return; }
 
   local src name dst
   for src in "$MODS_SRC"/*/; do
@@ -162,9 +169,85 @@ deploy_mods() {
   deploy_to_dir "$MODS_SRC" "$MODS_DST" "$MODS_SRC" "mod"
 }
 
+# ---------------------------------------------------------------- herdr-app
+deploy_herdr_app() {
+  local keys_src="$HERDR_APP_SRC/keys.json"
+
+  step "4/5 合并 herdr-app 快捷键配置"
+  printf '    源:   %s\n    目标: %s\n' "$keys_src" "$HERDR_KEYS_DST"
+
+  [ -f "$keys_src" ] || { warn "未找到 config/herdr-app/keys.json，跳过"; return; }
+  [ -f "$HERDR_KEYS_DST" ] || {
+    warn "未找到 $HERDR_KEYS_DST，跳过；请先启动一次 herdr-app"
+    return
+  }
+  command -v python3 >/dev/null 2>&1 || {
+    warn "未找到 python3，无法安全合并 keys.json，跳过"
+    return
+  }
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '    merge-json %s -> %s（仅补充缺失项，不覆盖冲突）\n' "$keys_src" "$HERDR_KEYS_DST"
+    return
+  fi
+
+  python3 - "$keys_src" "$HERDR_KEYS_DST" <<'PY'
+import json
+import os
+import shutil
+import stat
+import sys
+import tempfile
+
+src_path, dst_path = sys.argv[1:]
+with open(src_path, encoding="utf-8") as f:
+    source = json.load(f)
+with open(dst_path, encoding="utf-8") as f:
+    target = json.load(f)
+
+added = []
+conflicts = []
+
+
+def merge_missing(dst, src, path=()):
+    for key, value in src.items():
+        key_path = path + (key,)
+        if key not in dst:
+            dst[key] = value
+            added.append(".".join(key_path))
+        elif isinstance(dst[key], dict) and isinstance(value, dict):
+            merge_missing(dst[key], value, key_path)
+        elif dst[key] != value:
+            conflicts.append(".".join(key_path))
+
+
+merge_missing(target, source)
+if added:
+    backup_path = dst_path + ".opcflow-backup"
+    shutil.copy2(dst_path, backup_path)
+    dst_dir = os.path.dirname(dst_path) or "."
+    fd, temp_path = tempfile.mkstemp(prefix=".keys.json.", dir=dst_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(target, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.chmod(temp_path, stat.S_IMODE(os.stat(dst_path).st_mode))
+        os.replace(temp_path, dst_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    print("    [ok]   新增快捷键: " + ", ".join(added))
+else:
+    print("    [skip] 快捷键配置已存在")
+
+for key_path in conflicts:
+    print("    [warn] 保留已有冲突配置: " + key_path)
+PY
+}
+
 # ---------------------------------------------------------------- herdr-core
 deploy_herdr() {
-  step "4/4 部署 herdr-core 配置（复制）"
+  step "5/5 部署 herdr-core 配置（复制）"
   printf '    源:   %s\n    目标: %s\n' "$HERDR_SRC" "$HERDR_DST"
 
   [ -d "$HERDR_SRC" ] || { warn "未找到 config/herdr-core，跳过"; return; }
@@ -186,5 +269,6 @@ fi
 deploy_skills
 deploy_claude_bridge
 deploy_mods
+deploy_herdr_app
 deploy_herdr
 printf '\n完成。平台: %s / %s\n' "$(uname -s)" "$(uname -m)"
