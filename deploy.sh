@@ -5,7 +5,8 @@
 #   1. skills/           软链接到通用 skill 目录（默认 ~/.agents/skills，
 #                        可被任意 agent 读取，不绑定特定工具）
 #   2. 通用目录中的 skill 桥接到 ~/.claude/skills，供 Claude Code 加载
-#   3. config/herdr-core 复制到 herdr-core 配置目录
+#   3. herdr-mod/*        软链接到 herdr-app 的 mods 目录
+#   4. config/herdr-core 复制到 herdr-core 配置目录
 #                        默认: ${XDG_CONFIG_HOME:-~/.config}/herdr-core
 
 set -euo pipefail
@@ -26,7 +27,10 @@ usage() {
   2. Claude 桥接         通用目录中的 skill 软链接到 ~/.claude/skills，
                          供 Claude Code 加载；--no-claude 可跳过
                          覆盖: 环境变量 CLAUDE_SKILLS_DIR
-  3. config/herdr-core  复制到 herdr-core 配置目录
+  3. herdr-mod/*        软链接到 herdr-app 的 mods 目录
+                         默认: ~/.config/herdr-app/mods
+                         覆盖: 环境变量 HERDR_MODS_DIR
+  4. config/herdr-core  复制到 herdr-core 配置目录
                          默认: \${XDG_CONFIG_HOME:-~/.config}/herdr-core
                          覆盖: 环境变量 HERDR_CONFIG_DIR
 
@@ -46,12 +50,15 @@ esac
 
 REPO_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILLS_SRC="$REPO_DIR/skills"
+MODS_SRC="$REPO_DIR/herdr-mod"
 HERDR_SRC="$REPO_DIR/config/herdr-core"
 
 # 通用 skill 目录（不绑定具体 agent 工具）
 SKILLS_DST="${SKILLS_DIR:-$HOME/.agents/skills}"
 # Claude Code 桥接目录（指向通用目录，便于 Claude Code 加载）
 CLAUDE_DST="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
+# herdr-app mods 目录
+MODS_DST="${HERDR_MODS_DIR:-$HOME/.config/herdr-app/mods}"
 # herdr-core 配置目录
 HERDR_DST="${HERDR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-core}"
 
@@ -77,14 +84,14 @@ repoint() {
   return 2              # 已重新链接
 }
 
-# 对每个 skill 执行 $1 目录中的链接/桥接
+# 把 $1 目录下的每个子目录链接/桥接到 $2 目录（目标为 $3 下同名路径）
 deploy_to_dir() {
-  local dst_dir="$1" target_base="$2" label="$3"
+  local src_dir="$1" dst_dir="$2" target_base="$3" label="$4"
   local src name dst target
 
   [ -d "$dst_dir" ] || do_mkdir "$dst_dir"
 
-  for src in "$SKILLS_SRC"/*/; do
+  for src in "$src_dir"/*/; do
     [ -d "$src" ] || continue
     name="${src%/}"; name="${name##*/}"
     dst="$dst_dir/$name"
@@ -108,7 +115,7 @@ deploy_to_dir() {
 
 # ---------------------------------------------------------------- skills
 deploy_skills() {
-  step "1/3 部署 skills 到通用 skill 目录（软链接）"
+  step "1/4 部署 skills 到通用 skill 目录（软链接）"
   printf '    源:   %s\n    目标: %s\n' "$SKILLS_SRC" "$SKILLS_DST"
 
   [ -d "$SKILLS_SRC" ] || { warn "未找到 skills 目录，跳过"; return; }
@@ -120,12 +127,12 @@ deploy_skills() {
     [ -f "$src/SKILL.md" ] || warn "$name 缺少 SKILL.md，部分 agent 可能不会加载它"
   done
 
-  deploy_to_dir "$SKILLS_DST" "$SKILLS_SRC" "通用"
+  deploy_to_dir "$SKILLS_SRC" "$SKILLS_DST" "$SKILLS_SRC" "通用"
 }
 
 # ---------------------------------------------------------------- claude 桥接
 deploy_claude_bridge() {
-  step "2/3 桥接通用 skill 到 Claude Code（软链接）"
+  step "2/4 桥接通用 skill 到 Claude Code（软链接）"
   printf '    源:   %s\n    目标: %s\n' "$SKILLS_DST" "$CLAUDE_DST"
 
   [ "$NO_CLAUDE" -eq 1 ] && { skip_ "已用 --no-claude 跳过"; return; }
@@ -135,12 +142,29 @@ deploy_claude_bridge() {
     return
   fi
 
-  deploy_to_dir "$CLAUDE_DST" "$SKILLS_DST" "Claude"
+  deploy_to_dir "$SKILLS_SRC" "$CLAUDE_DST" "$SKILLS_DST" "Claude"
+}
+
+# ---------------------------------------------------------------- herdr mods
+deploy_mods() {
+  step "3/4 部署 herdr mods 到 herdr-app（软链接）"
+  printf '    源:   %s\n    目标: %s\n' "$MODS_SRC" "$MODS_DST"
+
+  [ -d "$MODS_SRC" ] || { warn "未找到 herdr-mod 目录，跳过"; return; }
+
+  local src name dst
+  for src in "$MODS_SRC"/*/; do
+    [ -d "$src" ] || continue
+    name="${src%/}"; name="${name##*/}"
+    [ -f "$src/mod.json" ] || warn "$name 缺少 mod.json，herdr-app 可能不会加载它"
+  done
+
+  deploy_to_dir "$MODS_SRC" "$MODS_DST" "$MODS_SRC" "mod"
 }
 
 # ---------------------------------------------------------------- herdr-core
 deploy_herdr() {
-  step "3/3 部署 herdr-core 配置（复制）"
+  step "4/4 部署 herdr-core 配置（复制）"
   printf '    源:   %s\n    目标: %s\n' "$HERDR_SRC" "$HERDR_DST"
 
   [ -d "$HERDR_SRC" ] || { warn "未找到 config/herdr-core，跳过"; return; }
@@ -161,5 +185,6 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 deploy_skills
 deploy_claude_bridge
+deploy_mods
 deploy_herdr
 printf '\n完成。平台: %s / %s\n' "$(uname -s)" "$(uname -m)"
