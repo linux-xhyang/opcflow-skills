@@ -43,6 +43,7 @@ HERDR_APP_DST="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
 MODS_DST="${HERDR_MODS_DIR:-$HERDR_APP_DST/mods}"
 LAYOUTS_DST="${HERDR_LAYOUTS_DIR:-$HERDR_APP_DST/layouts}"
 HERDR_KEYS_DST="${HERDR_KEYS_FILE:-$HERDR_APP_DST/keys.json}"
+HERDR_PROGRAMS_DST="${HERDR_PROGRAMS_FILE:-$HERDR_APP_DST/programs.json}"
 HERDR_CORE_DST="${HERDR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-core}"
 
 step() { printf '\n==> %s\n' "$*"; }
@@ -158,6 +159,71 @@ if added:
     print("    [ok]   新增快捷键: " + ", ".join(added))
 else:
     print("    [skip] 快捷键配置已存在")
+for key_path in conflicts:
+    print("    [warn] 保留已有冲突配置: " + key_path)
+PY
+fi
+
+step "合并 Herdr program 配置"
+programs_src="$HERDR_APP_SRC/programs.json"
+printf '    源:   %s\n    目标: %s\n' "$programs_src" "$HERDR_PROGRAMS_DST"
+if [ ! -f "$programs_src" ]; then
+  warn "未找到 config/herdr-app/programs.json"
+elif [ "$DRY_RUN" -eq 1 ]; then
+  printf '    merge-json %s -> %s（只补缺失项，保留冲突）\n' "$programs_src" "$HERDR_PROGRAMS_DST"
+elif ! command -v python3 >/dev/null 2>&1; then
+  warn "未找到 python3，无法安全合并 programs.json"
+else
+  python3 - "$programs_src" "$HERDR_PROGRAMS_DST" <<'PY'
+import json
+import os
+import stat
+import sys
+import tempfile
+
+src_path, dst_path = sys.argv[1:]
+with open(src_path, encoding="utf-8") as f:
+    source = json.load(f)
+try:
+    with open(dst_path, encoding="utf-8") as f:
+        target = json.load(f)
+except FileNotFoundError:
+    target = {}
+
+if not isinstance(source, dict) or not isinstance(target, dict):
+    raise SystemExit("programs.json must contain a JSON object")
+
+added = []
+conflicts = []
+
+def merge_missing(dst, src, path=()):
+    for key, value in src.items():
+        key_path = path + (key,)
+        if key not in dst:
+            dst[key] = value
+            added.append(".".join(key_path))
+        elif isinstance(dst[key], dict) and isinstance(value, dict):
+            merge_missing(dst[key], value, key_path)
+        elif dst[key] != value:
+            conflicts.append(".".join(key_path))
+
+merge_missing(target, source)
+if added:
+    dst_dir = os.path.dirname(dst_path) or "."
+    os.makedirs(dst_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".programs.json.", dir=dst_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(target, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.chmod(temp_path, stat.S_IMODE(os.stat(dst_path).st_mode) if os.path.exists(dst_path) else 0o600)
+        os.replace(temp_path, dst_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    print("    [ok]   新增 program 配置: " + ", ".join(added))
+else:
+    print("    [skip] program 配置已存在")
 for key_path in conflicts:
     print("    [warn] 保留已有冲突配置: " + key_path)
 PY
