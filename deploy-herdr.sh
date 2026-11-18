@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy-herdr.sh — 部署 Herdr mods、layout、快捷键与 herdr-core 配置。
+# deploy-herdr.sh — 部署 Herdr app 子系统与事务化 herdr-flow release。
 # 兼容 macOS 自带 bash 3.2 与 Linux bash。
 
 set -euo pipefail
@@ -10,7 +10,18 @@ usage() {
 
   无选项            部署并切换到 emacs-main layout
   -n, --dry-run     只预览，不修改文件或切换 layout
+  --allow-dirty     显式部署带独立身份的 development release
   --no-switch       部署后不切换到 emacs-main layout
+  rollback TARGET   回滚到精确 retained receipt 或 release
+  recover --complete OPERATION_ID
+  recover --rollback OPERATION_ID
+                    显式完成或回退已激活的中断事务
+  doctor            只读检查部署状态
+  diagnose OPERATION_ID
+                    只读解释一个部署事务及恢复选项
+  gc [PLAN_DIGEST]  无 digest 时只生成计划；有 digest 时执行该计划
+  support-bundle OUTPUT
+                    导出严格脱敏的部署支持包
   -h, --help        显示本帮助
 
 目标目录:
@@ -23,9 +34,55 @@ EOF
 
 DRY_RUN=0
 NO_SWITCH=0
+ALLOW_DIRTY=0
+FLOW_ACTION=apply
+FLOW_ARGUMENT_1=
+FLOW_ARGUMENT_2=
+case "${1:-}" in
+  rollback)
+    [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+    FLOW_ACTION=rollback
+    FLOW_ARGUMENT_1="$2"
+    shift 2
+    ;;
+  recover)
+    [ "$#" -eq 3 ] || { usage >&2; exit 2; }
+    case "$2" in
+      --complete|--rollback) FLOW_ARGUMENT_1="$2" ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    FLOW_ACTION=recover
+    FLOW_ARGUMENT_2="$3"
+    shift 3
+    ;;
+  doctor)
+    [ "$#" -eq 1 ] || { usage >&2; exit 2; }
+    FLOW_ACTION=doctor
+    shift
+    ;;
+  diagnose)
+    [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+    FLOW_ACTION=diagnose
+    FLOW_ARGUMENT_1="$2"
+    shift 2
+    ;;
+  gc)
+    [ "$#" -le 2 ] || { usage >&2; exit 2; }
+    FLOW_ACTION=gc
+    FLOW_ARGUMENT_1="${2:-}"
+    shift "$#"
+    ;;
+  support-bundle)
+    [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+    FLOW_ACTION=support-bundle
+    FLOW_ARGUMENT_1="$2"
+    shift 2
+    ;;
+esac
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -n|--dry-run) DRY_RUN=1 ;;
+    --allow-dirty) ALLOW_DIRTY=1 ;;
     --no-switch)  NO_SWITCH=1 ;;
     -h|--help)    usage; exit 0 ;;
     *)            printf '未知参数: %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
@@ -37,14 +94,12 @@ REPO_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODS_SRC="$REPO_DIR/config/herdr-mod"
 LAYOUTS_SRC="$REPO_DIR/config/herdr-layout"
 HERDR_APP_SRC="$REPO_DIR/config/herdr-app"
-HERDR_CORE_SRC="$REPO_DIR/config/herdr-core"
 
 HERDR_APP_DST="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
 MODS_DST="${HERDR_MODS_DIR:-$HERDR_APP_DST/mods}"
 LAYOUTS_DST="${HERDR_LAYOUTS_DIR:-$HERDR_APP_DST/layouts}"
 HERDR_KEYS_DST="${HERDR_KEYS_FILE:-$HERDR_APP_DST/keys.json}"
 HERDR_PROGRAMS_DST="${HERDR_PROGRAMS_FILE:-$HERDR_APP_DST/programs.json}"
-HERDR_CORE_DST="${HERDR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-core}"
 
 step() { printf '\n==> %s\n' "$*"; }
 done_() { printf '    [ok]   %s\n' "$*"; }
@@ -54,7 +109,46 @@ warn() { printf '    [warn] %s\n' "$*"; }
 do_mkdir() { if [ "$DRY_RUN" -eq 0 ]; then mkdir -p "$1"; else printf '    mkdir -p %s\n' "$1"; fi; }
 do_rm() { if [ "$DRY_RUN" -eq 0 ]; then rm "$1"; else printf '    rm %s\n' "$1"; fi; }
 do_ln() { if [ "$DRY_RUN" -eq 0 ]; then ln -s "$1" "$2"; else printf '    ln -s %s %s\n' "$1" "$2"; fi; }
-do_cp() { if [ "$DRY_RUN" -eq 0 ]; then cp -R "$1" "$2"; else printf '    cp -R %s %s\n' "$1" "$2"; fi; }
+
+flow_cli() {
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_DIR/src" \
+    python3 -m herdr_flow deploy "$@"
+}
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf 'herdr-flow 部署需要 Python 3.11 或 3.12。\n' >&2
+  exit 10
+fi
+
+if [ "$FLOW_ACTION" != apply ]; then
+  case "$FLOW_ACTION" in
+    rollback) flow_cli rollback "$FLOW_ARGUMENT_1" --json ;;
+    recover) flow_cli recover "$FLOW_ARGUMENT_2" "$FLOW_ARGUMENT_1" --json ;;
+    doctor) flow_cli doctor --json ;;
+    diagnose) flow_cli diagnose "$FLOW_ARGUMENT_1" --json ;;
+    gc)
+      if [ -n "$FLOW_ARGUMENT_1" ]; then
+        flow_cli gc --apply-plan "$FLOW_ARGUMENT_1" --json
+      else
+        flow_cli gc --json
+      fi
+      ;;
+    support-bundle) flow_cli support-bundle "$FLOW_ARGUMENT_1" --json ;;
+  esac
+  exit $?
+fi
+
+flow_apply_arguments=""
+if [ "$ALLOW_DIRTY" -eq 1 ]; then
+  flow_apply_arguments="--allow-dirty"
+fi
+
+if [ "$DRY_RUN" -eq 0 ]; then
+  step "herdr-flow 只读 preflight"
+  # shellcheck disable=SC2086
+  flow_cli apply --repository "$REPO_DIR" --dry-run $flow_apply_arguments --json
+  done_ "herdr-flow preflight 通过"
+fi
 
 link_path() {
   local target="$1" dst="$2" label="$3"
@@ -229,18 +323,15 @@ for key_path in conflicts:
 PY
 fi
 
-step "部署 herdr-core 配置"
-printf '    源:   %s\n    目标: %s\n' "$HERDR_CORE_SRC" "$HERDR_CORE_DST"
-if [ -d "$HERDR_CORE_SRC" ]; then
-  [ -d "$HERDR_CORE_DST" ] || do_mkdir "$HERDR_CORE_DST"
-  for src in "$HERDR_CORE_SRC"/*; do
-    [ -e "$src" ] || continue
-    name="${src##*/}"
-    do_cp "$src" "$HERDR_CORE_DST/"
-    done_ "复制 $name"
-  done
+step "部署 herdr-flow release 与受管 Herdr templates"
+if [ "$DRY_RUN" -eq 1 ]; then
+  # shellcheck disable=SC2086
+  flow_cli apply --repository "$REPO_DIR" --dry-run $flow_apply_arguments --json
+  done_ "事务部署预览完成（零写入）"
 else
-  warn "未找到 config/herdr-core"
+  # shellcheck disable=SC2086
+  flow_cli apply --repository "$REPO_DIR" $flow_apply_arguments --json
+  done_ "release 已激活；如 Herdr Core 已运行，请手工 reload/restart"
 fi
 
 step "切换到 emacs-main layout"

@@ -2,29 +2,31 @@
 """Scan agent CLI session logs and print one JSON object: {"sessions": [...]}.
 
 会话日志目录映射（与 herdr-core session_log.rs 一致）:
-  traex  -> $TRAE_HOME/cli/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl
+  traex  -> traecli app-server thread/list（逻辑会话，自动分页）
   claude -> ~/.claude/projects/<编码项目>/<uuid>.jsonl
   codex  -> ~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl
   cursor -> ~/.cursor/projects
   grok   -> $GROK_HOME/sessions（默认 ~/.grok/sessions）
   pi     -> ~/.pi/agent/sessions
 
-每行输出字段: cli, id, title(首条用户消息), cwd(从 jsonl 行内读取，用于恢复),
+每行输出字段: cli, id, title(TRAE 名称优先，其余取首条用户消息), cwd,
 mtime, path。只列最近 DAYS 天、最多 LIMIT 个。
 """
 import json
 import os
-import re
+import selectors
+import shutil
 import stat
+import subprocess
 import sys
 import time
+import uuid
 
 HOME = os.path.expanduser("~")
 TRAE_HOME = os.path.expanduser(os.environ.get("TRAE_HOME", os.path.join(HOME, ".trae")))
 DAYS = 90
 LIMIT = 400
 HEAD_BYTES = 131072  # 每个文件只读前 128KB 取标题
-TRAE_META_BYTES = 1048576  # 旧版 TraeX session_meta 含完整指令，首行可达数百 KB
 
 ROOTS = [
     ("traex", os.path.join(TRAE_HOME, "cli", "sessions"), 5),
@@ -36,8 +38,158 @@ ROOTS = [
 ]
 
 
+class TraeRpc:
+    """Short-lived JSONL client for the standard app-server stdio transport."""
+
+    def __init__(self, command, deadline):
+        self.deadline = deadline
+        self.sequence = 0
+        self.buffer = b""
+        self.stderr = b""
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.process.stdout, selectors.EVENT_READ)
+        self.selector.register(self.process.stderr, selectors.EVENT_READ)
+
+    def send(self, message):
+        self.process.stdin.write((json.dumps(message) + "\n").encode())
+        self.process.stdin.flush()
+
+    def request(self, method, params):
+        self.sequence += 1
+        request_id = self.sequence
+        self.send({"id": request_id, "method": method, "params": params})
+        while True:
+            while b"\n" in self.buffer:
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                message = json.loads(line)
+                if message.get("method"):
+                    if "id" in message:
+                        self.send({"id": message["id"], "error": {
+                            "code": -32601, "message": "Sessions is a read-only list client"}})
+                    continue
+                if message.get("id") != request_id:
+                    continue
+                if "error" in message:
+                    raise ValueError(message["error"].get("message", "TRAE RPC failed"))
+                return message["result"]
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("TRAE 会话列表读取超时")
+            if not self.selector.get_map():
+                raise RuntimeError("TRAE app-server 已退出: " + self.stderr.decode(errors="replace")[-1000:])
+            for key, _ in self.selector.select(remaining):
+                data = os.read(key.fileobj.fileno(), 65536)
+                if not data:
+                    self.selector.unregister(key.fileobj)
+                elif key.fileobj is self.process.stdout:
+                    self.buffer += data
+                else:
+                    self.stderr = (self.stderr + data)[-4096:]
+
+    def close(self):
+        self.selector.close()
+        try:
+            self.process.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        self.process.stdout.close()
+        self.process.stderr.close()
+
+
+def trae_executable():
+    executable = shutil.which("traecli")
+    if not executable:
+        raise ValueError("找不到 traecli；TRAE 会话列表需要标准 app-server 接口")
+    return executable
+
+
+def connect_trae(deadline):
+    client = TraeRpc([trae_executable(), "app-server", "--stdio"], deadline)
+    try:
+        client.request("initialize", {
+            "clientInfo": {"name": "herdr_sessions", "version": "1.0"},
+            "capabilities": {"experimentalApi": True},
+        })
+        client.send({"method": "initialized"})
+        return client
+    except (OSError, ValueError, RuntimeError, TimeoutError):
+        client.close()
+        raise
+
+
+def list_trae_sessions(archived=False):
+    """List logical threads, never physical rollout fragments."""
+    client = connect_trae(time.monotonic() + 20)
+    rows = {}
+    cursor = None
+    seen_cursors = set()
+    cutoff = time.time() - DAYS * 86400
+    try:
+        while len(rows) < LIMIT:
+            params = {"archived": archived, "limit": 50,
+                      "sortKey": "updated_at", "sortDirection": "desc",
+                      "useStateDbOnly": True}
+            if cursor:
+                params["cursor"] = cursor
+            page = client.request("thread/list", params)
+            old = False
+            for thread in page["data"]:
+                updated = thread.get("updatedAt", 0)
+                if updated < cutoff:
+                    old = True
+                    continue
+                session_id = thread["id"]
+                rows[session_id] = {
+                    "cli": "traex", "id": session_id,
+                    "title": (thread.get("name") or thread.get("preview") or session_id)[:160],
+                    "cwd": thread.get("cwd") or "", "mtime": updated,
+                    "path": thread.get("path") or "", "archived": archived,
+                }
+            cursor = page.get("nextCursor")
+            if old or not cursor:
+                break
+            if cursor in seen_cursors:
+                raise ValueError("TRAE 会话列表返回重复分页游标")
+            seen_cursors.add(cursor)
+    finally:
+        client.close()
+    return sorted(rows.values(), key=lambda row: -row["mtime"])[:LIMIT]
+
+
+def manage_trae_session(action, session_id):
+    if action not in {"delete", "archive", "unarchive"}:
+        raise ValueError("未知 TRAE 会话操作")
+    # Do not accept a legacy rollout path or let an ID become a CLI flag.
+    try:
+        uuid.UUID(session_id)
+    except ValueError:
+        raise ValueError("TRAE 操作需要逻辑会话 UUID，不能使用历史文件路径") from None
+    command = [trae_executable(), action, session_id]
+    if action == "delete":
+        command.append("--force")  # UI has already confirmed; dependency checks still apply.
+    result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+    if result.returncode:
+        raise ValueError((result.stderr or result.stdout or "TRAE 会话操作失败").strip())
+    return {"action": action, "id": session_id}
+
+
 def delete_session(cli, path, roots=None):
     """把受管会话日志移入对应根目录的 .deleted，拒绝任意路径删除。"""
+    if cli == "traex":
+        raise ValueError("TRAE 会话不能按历史文件删除；请使用逻辑会话 UUID")
     if roots is None:
         roots = ROOTS
     roots_by_cli = {name: root for name, root, _depth in roots}
@@ -118,87 +270,18 @@ def first_user_title(head: bytes):
     return title, cwd
 
 
-def traex_head_metadata(head: bytes):
-    """提取 TraeX rollout 的真实 session id、cwd、首条用户输入和线程类型。"""
-    session_id = None
-    cwd = None
-    title = None
-    is_subagent = False
-    for line in head.split(b"\n"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            d = json.loads(line)
-        except Exception:
-            break
-        payload = d.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        if d.get("type") == "session_meta":
-            value = payload.get("id") or payload.get("session_id")
-            if isinstance(value, str) and value:
-                session_id = value
-            value = payload.get("cwd")
-            if isinstance(value, str) and value:
-                cwd = value
-            source = payload.get("source")
-            is_subagent = payload.get("thread_source") == "subagent" or (
-                isinstance(source, dict) and "subagent" in source
-            )
-        elif (
-            title is None
-            and d.get("type") == "response_item"
-            and payload.get("type") == "message"
-            and payload.get("role") == "user"
-            and isinstance(d.get("metadata"), dict)
-            and d["metadata"].get("user_input_order") == 0
-        ):
-            title = message_text(payload.get("content"))
-    return title, cwd, session_id, is_subagent
-
-
-def load_traex_titles(trae_home=TRAE_HOME):
-    """从轻量 history.jsonl 建立 session id -> 首条用户输入索引。"""
-    titles = {}
-    path = os.path.join(trae_home, "cli", "history.jsonl")
-    try:
-        f = open(path, encoding="utf-8")
-    except OSError:
-        return titles
-    with f:
-        for line in f:
-            try:
-                item = json.loads(line)
-            except Exception:
-                continue
-            session_id = item.get("session_id")
-            text = item.get("text")
-            if (
-                isinstance(session_id, str)
-                and session_id
-                and session_id not in titles
-                and isinstance(text, str)
-                and text.strip()
-            ):
-                titles[session_id] = text.strip()
-    return titles
-
-
-def traex_id_from_filename(filename):
-    """metadata 不可读时，从 rollout 文件名末尾提取可用于 resume 的 UUID。"""
-    match = re.search(
-        r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$",
-        filename,
-    )
-    return match.group(1) if match else filename[:-6]
-
-
-def scan():
+def scan(archived=False):
     now = time.time()
     out = []
-    traex_titles = load_traex_titles()
+    warnings = []
+    if any(cli == "traex" for cli, _root, _depth in ROOTS):
+        try:
+            out.extend(list_trae_sessions(archived))
+        except (OSError, ValueError, RuntimeError, TimeoutError) as error:
+            warnings.append(f"TRAE 会话列表不可用：{error}")
     for cli, root, depth in ROOTS:
+        if cli == "traex" or archived:
+            continue
         if not os.path.isdir(root):
             continue
         base_depth = root.rstrip(os.sep).count(os.sep)
@@ -219,24 +302,11 @@ def scan():
                     continue
                 try:
                     with open(path, "rb") as f:
-                        if cli == "traex":
-                            # TraeX 的 session_meta 总在首行；旧版本会把完整指令放进去，
-                            # 先完整读取该行，再只取后续 128KB 寻找首条用户输入。
-                            head = f.readline(TRAE_META_BYTES) + f.read(HEAD_BYTES)
-                        else:
-                            head = f.read(HEAD_BYTES)
+                        head = f.read(HEAD_BYTES)
                 except OSError:
                     continue
-                session_id = traex_id_from_filename(fn) if cli == "traex" else fn[:-6]
-                if cli == "traex":
-                    title, cwd, meta_id, is_subagent = traex_head_metadata(head)
-                    if is_subagent:
-                        continue
-                    if meta_id:
-                        session_id = meta_id
-                    title = traex_titles.get(session_id) or title
-                else:
-                    title, cwd = first_user_title(head)
+                session_id = fn[:-6]
+                title, cwd = first_user_title(head)
                 out.append({
                     "cli": cli,
                     "id": session_id,
@@ -246,22 +316,30 @@ def scan():
                     "path": path,
                 })
     out.sort(key=lambda x: -x["mtime"])
-    print(json.dumps({"sessions": out[:LIMIT]}, ensure_ascii=False))
+    print(json.dumps({"sessions": out[:LIMIT], "warnings": warnings}, ensure_ascii=False))
 
 
 def main(argv):
     if not argv:
         scan()
         return 0
-    if len(argv) == 3 and argv[0] == "--delete":
+    if argv == ["--archived"]:
+        scan(archived=True)
+        return 0
+    if len(argv) == 3 and argv[0] in {"--delete", "--archive", "--unarchive"}:
         try:
-            deleted_path = delete_session(argv[1], argv[2])
-        except (OSError, ValueError) as error:
+            if argv[1] == "traex":
+                result = manage_trae_session(argv[0][2:], argv[2])
+            elif argv[0] == "--delete":
+                result = {"deleted_to": delete_session(argv[1], argv[2])}
+            else:
+                raise ValueError("归档仅支持 TRAE 会话")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             print(str(error), file=sys.stderr)
             return 1
-        print(json.dumps({"deleted_to": deleted_path}, ensure_ascii=False))
+        print(json.dumps(result, ensure_ascii=False))
         return 0
-    print("用法: scan.py [--delete <cli> <session.jsonl>]", file=sys.stderr)
+    print("用法: scan.py [--archived | --delete <cli> <path-or-id> | --archive/--unarchive traex <uuid>]", file=sys.stderr)
     return 2
 
 

@@ -6,11 +6,11 @@
 //   - 恢复：在新 tab 里跑对应 CLI 的 resume 命令
 //   - 打开会话所在项目目录（macOS: open，Linux: xdg-open）
 //
-// 数据来源: scan.py（一次 exec，读各 CLI 的会话日志目录，只取每文件前 128KB 的标题）。
+// 数据来源: scan.py（TRAE 使用 thread/list，其余 CLI 扫描会话日志）。
 // 打开方式: pane.split {"direction": "right", "mod": "sessions"}
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, Textarea, TextareaState } from "gpui-base";
-import { theme, exec, run, spaces, panes, focused, agents, appHome, window } from "herdr";
+import { theme, exec, run, spaces, panes, focused, agents, appHome, readTextFile, window } from "herdr";
 
 // 各 CLI 的显示名与恢复命令；没有 resume 的（cursor/pi）只提供打开目录
 const CLI_META = {
@@ -33,14 +33,48 @@ const APP_TO_CLI = {
   pi: "pi",
 };
 const CLIS = ["traex", "claude", "codex", "grok", "cursor", "pi"];
+const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+// A remote Herdr core runs programs on its own host but does not receive this
+// app's mod files.  Read scan.py locally and execute its exact UTF-8 source in
+// the remote Python process, with its normal command-line arguments restored.
+const REMOTE_SCANNER_BOOTSTRAP = "import base64,sys;source,*args=sys.argv[1:];sys.argv=['scan.py',*args];exec(compile(base64.b64decode(source).decode('utf-8'),'<herdr-sessions-scan>','exec'))";
+
+function base64Utf8(value) {
+  // gpui-shell deliberately exposes only ES2022 byte primitives. scan.py is
+  // UTF-8 source, so encode it directly before passing it as one argv string.
+  const bytes = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const codepoint = value.codePointAt(index);
+    if (codepoint > 0xffff) index += 1;
+    if (codepoint <= 0x7f) bytes.push(codepoint);
+    else if (codepoint <= 0x7ff) bytes.push(0xc0 | (codepoint >> 6), 0x80 | (codepoint & 0x3f));
+    else if (codepoint <= 0xffff) bytes.push(0xe0 | (codepoint >> 12), 0x80 | ((codepoint >> 6) & 0x3f), 0x80 | (codepoint & 0x3f));
+    else bytes.push(0xf0 | (codepoint >> 18), 0x80 | ((codepoint >> 12) & 0x3f), 0x80 | ((codepoint >> 6) & 0x3f), 0x80 | (codepoint & 0x3f));
+  }
+  let encoded = "";
+  for (let index = 0; index < bytes.length; index += 3) {
+    const left = bytes[index];
+    const middle = bytes[index + 1];
+    const right = bytes[index + 2];
+    encoded += BASE64[left >> 2];
+    encoded += BASE64[((left & 0x03) << 4) | ((middle ?? 0) >> 4)];
+    encoded += middle === undefined ? "=" : BASE64[((middle & 0x0f) << 2) | ((right ?? 0) >> 6)];
+    encoded += right === undefined ? "=" : BASE64[right & 0x3f];
+  }
+  return encoded;
+}
 
 function normalizePath(path) {
   return (path || "").replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
+function sessionKey(session) {
+  return `${session.machine ?? "local"}:${session.cli}:${session.id}`;
+}
+
 function activeSpaceContext() {
   const space = spaces().find((s) => s.active);
-  if (!space) return { id: null, name: "当前 Space", roots: [] };
+  if (!space) return { id: null, name: "当前 Space", machine: null, roots: [] };
   const tabs = new Set((space.tabs ?? []).map((tab) => tab.id));
   const paneRoots = panes()
     .filter((pane) => tabs.has(pane.tab) && pane.cwd)
@@ -50,10 +84,15 @@ function activeSpaceContext() {
   const roots = [...new Set(candidates.filter(Boolean))].filter(
     (path, _index, all) => !all.some((other) => other !== path && path.startsWith(other + "/")),
   );
-  return { id: space.id, name: space.name || "当前 Space", roots };
+  return { id: space.id, name: space.name || "当前 Space", machine: space.machine ?? null, roots };
 }
 
 function inSpace(session, context) {
+  if ((session.machine ?? null) !== context.machine) return false;
+  // A remote space may not expose its cwd until one of its panes is shown.
+  // In that case "current Space" safely means all sessions on that host,
+  // rather than silently showing an empty local-looking list.
+  if (!context.roots.length) return true;
   const cwd = normalizePath(session.cwd);
   return Boolean(cwd && context.roots.some((root) => cwd === root || cwd.startsWith(root + "/")));
 }
@@ -83,9 +122,15 @@ export default class Sessions extends View {
     this.loading = false;
     this.error = null;
     this.pendingDelete = null;
-    this.deletingPath = null;
-    this.deletedPaths = new Set();
+    this.actionKey = null;
+    this.actionError = null;
+    this.showArchived = false;
+    this.scanGeneration = 0;
+    this.refreshPending = false;
+    this.activeScan = null;
     this.currentKey = null; // `${cli}:${id}` 当前 tab 的会话
+    this.contextKey = null;
+    this.remoteScanner = null;
     this.updated = 0;
     this.refresh(cx);
     this.refreshCurrent(cx);
@@ -116,7 +161,9 @@ export default class Sessions extends View {
     }
     let key = null;
     if (addr) {
-      const r = await exec("hc", ["get", addr, "--json"]).catch(() => null);
+      const machine = addr.includes("/") ? addr.split("/")[0] : activeSpaceContext().machine;
+      const terminal = machine && addr.startsWith(`${machine}/`) ? addr.slice(machine.length + 1) : addr;
+      const r = await exec("hc", ["get", terminal, "--json"], { on: machine }).catch(() => null);
       if (r?.code === 0) {
         try {
           const id = JSON.parse(r.stdout).labels?.["herdr-mobile-relay.session"] ?? null;
@@ -137,27 +184,82 @@ export default class Sessions extends View {
   }
 
   refresh(cx) {
-    if (this.loading) return;
+    if (this.loading) {
+      // Periodic ticks must not keep slow remote scans permanently queued.
+      // Queue only when a context/filter change or mutation invalidated the scan.
+      if (this.activeScan?.generation !== this.scanGeneration) this.refreshPending = true;
+      return;
+    }
+    const context = activeSpaceContext();
+    const generation = this.scanGeneration;
+    const archived = this.showArchived;
+    const scan = { generation };
+    this.activeScan = scan;
     this.loading = true;
+    // Herdr normally enforces the exec timeout. Also bound the UI wait if a
+    // disconnected remote transport never settles its promise.
+    cx.timer.after(35000, (cx) => {
+      if (this.activeScan !== scan) return;
+      this.activeScan = null;
+      this.loading = false;
+      if (generation === this.scanGeneration && context.id === activeSpaceContext().id) {
+        this.error = "会话读取超时，请检查远端连接后点击刷新";
+      }
+      if (this.refreshPending) {
+        this.refreshPending = false;
+        this.refresh(cx);
+      }
+      cx.notify();
+    });
     cx.spawn(async (cx) => {
       try {
-        // 注意：exec 直接传绝对路径脚本参数时 stdout 会被吞（app 端怪癖），
-        // 用 sh -c 'python3 "$1"' 包装（files mod 同款模式）输出才正常。
-        const r = await exec("sh", ["-c", 'python3 "$1"', "sessions", appHome() + "/mods/sessions/scan.py"], {
-          timeout: 30000,
-        });
+        const r = await this.scan(context, archived);
         if (r.code !== 0) throw new Error(r.stderr || `scan.py 退出码 ${r.code}`);
         const data = JSON.parse(r.stdout || "{}");
-        this.sessions = (data.sessions || []).filter((s) => !this.deletedPaths.has(s.path));
-        this.error = null;
+        if (this.activeScan !== scan || generation !== this.scanGeneration || context.id !== activeSpaceContext().id) return;
+        this.sessions = (data.sessions || [])
+          .map((session) => ({ ...session, machine: context.machine }));
+        this.error = (data.warnings || []).join("\n") || null;
         this.updated = Date.now();
       } catch (e) {
-        this.error = String(e);
+        if (this.activeScan === scan && generation === this.scanGeneration && context.id === activeSpaceContext().id) this.error = String(e);
       } finally {
+        if (this.activeScan !== scan) return;
+        this.activeScan = null;
         this.loading = false;
+        if (this.refreshPending) {
+          this.refreshPending = false;
+          this.refresh(cx);
+        }
         cx.notify();
       }
     });
+  }
+
+  async scannerSource() {
+    if (this.remoteScanner) return this.remoteScanner;
+    const source = await readTextFile(appHome() + "/mods/sessions/scan.py");
+    if (source === null || !source.trim()) throw new Error("Cannot read the local Sessions scanner source");
+    this.remoteScanner = base64Utf8(source);
+    return this.remoteScanner;
+  }
+
+  async scan(context, archived = false) {
+    const args = archived ? ["--archived"] : [];
+    if (!context.machine) {
+      // exec with an absolute Python-script argument loses stdout in this app;
+      // preserve the proven local wrapper path.
+      return exec("sh", ["-c", 'exec python3 "$@"', "sessions", appHome() + "/mods/sessions/scan.py", ...args], { timeout: 30000 });
+    }
+    const source = await this.scannerSource();
+    // Herdr's remote exec wrapper can reinterpret a leading `-c` passed
+    // directly to Python.  Its sh -c path is established by the local scanner
+    // and keeps both dynamic values as positional parameters, never shell text.
+    return exec(
+      "sh",
+      ["-c", 'exec python3 -c "$@"', "sessions", REMOTE_SCANNER_BOOTSTRAP, source, ...args],
+      { on: context.machine, timeout: 30000 },
+    );
   }
 
   filtered(context = activeSpaceContext()) {
@@ -173,8 +275,10 @@ export default class Sessions extends View {
 
   resume(s, cx) {
     const cmd = CLI_META[s.cli]?.resume;
-    if (!cmd) return;
+    const context = activeSpaceContext();
+    if (s.archived || !cmd || !context.id || (s.machine ?? null) !== context.machine) return;
     run("tab.new", {
+      space: context.id,
       folder: s.cwd || undefined,
       argv: cmd(s.id),
       name: s.title.replace(/\s+/g, " ").slice(0, 40) || undefined,
@@ -183,15 +287,27 @@ export default class Sessions extends View {
   }
 
   openFolder(s, cx) {
+    const context = activeSpaceContext();
+    if (s.machine) {
+      if (context.id && (s.machine ?? null) === context.machine) run("tab.new", { space: context.id, folder: s.cwd || undefined });
+      cx.notify();
+      return;
+    }
     const plat = window()?.platform;
     exec(plat === "macos" ? "open" : "xdg-open", [s.cwd]).catch(() => {});
     cx.notify();
   }
 
   requestDelete(s, cx) {
-    if (!s.path || this.currentKey === `${s.cli}:${s.id}` || this.deletingPath === s.path) return;
-    if (this.pendingDelete?.path !== s.path) {
-      const pending = { path: s.path };
+    if (s.machine) {
+      this.error = "Remote session deletion is disabled";
+      cx.notify();
+      return;
+    }
+    const key = sessionKey(s);
+    if ((s.cli !== "traex" && !s.path) || this.currentKey === `${s.cli}:${s.id}` || this.actionKey) return;
+    if (this.pendingDelete?.key !== key) {
+      const pending = { key };
       this.pendingDelete = pending;
       cx.timer.after(5000, (cx) => {
         if (this.pendingDelete === pending) {
@@ -204,23 +320,36 @@ export default class Sessions extends View {
     }
 
     this.pendingDelete = null;
-    this.deletingPath = s.path;
+    this.manageSession(s, "delete", cx);
+  }
+
+  manageSession(s, action, cx) {
+    const context = activeSpaceContext();
+    if (s.machine || context.machine || this.actionKey || this.currentKey === `${s.cli}:${s.id}`) return;
+    if (!context.id || (s.machine ?? null) !== context.machine) return;
+    if (action !== "delete" && s.cli !== "traex") return;
+    const key = sessionKey(s);
+    this.actionKey = key;
+    this.actionError = null;
+    this.scanGeneration += 1;
     cx.spawn(async (cx) => {
       try {
         const script = appHome() + "/mods/sessions/scan.py";
         const r = await exec(
           "sh",
-          ["-c", 'python3 "$1" --delete "$2" "$3"', "sessions", script, s.cli, s.path],
+          ["-c", 'exec python3 "$1" "$2" "$3" "$4"', "sessions", script, `--${action}`, s.cli, s.cli === "traex" ? s.id : s.path],
           { timeout: 30000 },
         );
-        if (r.code !== 0) throw new Error(r.stderr || `删除命令退出码 ${r.code}`);
-        this.deletedPaths.add(s.path);
-        this.sessions = this.sessions.filter((item) => item.path !== s.path);
-        this.error = null;
+        if (r.code !== 0) throw new Error(r.stderr || `会话操作退出码 ${r.code}`);
+        this.scanGeneration += 1;
+        if (context.id === activeSpaceContext().id) {
+          this.sessions = this.sessions.filter((item) => sessionKey(item) !== key);
+          this.refresh(cx);
+        }
       } catch (error) {
-        this.error = `删除失败：${String(error)}`;
+        this.actionError = `会话操作失败：${String(error)}`;
       } finally {
-        this.deletingPath = null;
+        this.actionKey = null;
         cx.notify();
       }
     });
@@ -260,6 +389,17 @@ export default class Sessions extends View {
           .gap(8)
           .child(div().font_semibold().text_size(14).child("Sessions"))
           .child(div().flex_1())
+          .child(this.btn(this.showArchived ? "返回会话" : "TRAE 归档", t, (cx) => {
+            this.showArchived = !this.showArchived;
+            this.cli = this.showArchived ? "traex" : "all";
+            this.pendingDelete = null;
+            this.actionError = null;
+            this.scanGeneration += 1;
+            this.sessions = [];
+            this.updated = 0;
+            this.refresh(cx);
+            cx.notify();
+          }))
           .child(div().text_size(11).text_color(t.dim).child(this.loading ? "刷新中…" : ""))
           .child(this.btn("刷新", t, (cx) => {
             this.refresh(cx);
@@ -272,7 +412,7 @@ export default class Sessions extends View {
           .children(
             [
               ["space", `当前 Space · ${context.name}`],
-              ["all", "全部 Space"],
+              ["all", "当前 Host 全部项目"],
             ].map(([key, label]) => {
               const on = scope === key;
               return div()
@@ -354,11 +494,13 @@ export default class Sessions extends View {
         .child(div().truncate().text_size(11).text_color(t.dim).child(s.cwd || "—")),
       div().text_size(11).text_color(t.dim).flex_none().w(58).text_right().child(fmtTime(s.mtime)),
     ];
-    if (meta.resume) kids.push(this.btn("恢复", t, (cx) => this.resume(s, cx)));
-    kids.push(this.btn("打开", t, (cx) => this.openFolder(s, cx)));
-    if (s.path && this.currentKey !== `${s.cli}:${s.id}`) {
+    if (meta.resume && !s.archived) kids.push(this.btn("恢复", t, (cx) => this.resume(s, cx)));
+    kids.push(this.btn(s.machine ? "终端" : "打开", t, (cx) => this.openFolder(s, cx)));
+    if (!s.machine && (s.cli === "traex" || s.path) && this.currentKey !== `${s.cli}:${s.id}`) {
+      const key = sessionKey(s);
+      if (s.cli === "traex") kids.push(this.btn(s.archived ? "取消归档" : "归档", t, (cx) => this.manageSession(s, s.archived ? "unarchive" : "archive", cx)));
       const deleteLabel =
-        this.deletingPath === s.path ? "删除中…" : this.pendingDelete?.path === s.path ? "确认删除" : "删除";
+        this.actionKey === key ? "处理中…" : this.pendingDelete?.key === key ? (s.cli === "traex" ? "确认永久删除" : "确认删除") : "删除";
       kids.push(this.btn(deleteLabel, t, (cx) => this.requestDelete(s, cx)));
     }
     return h_flex()
@@ -384,7 +526,8 @@ export default class Sessions extends View {
         .text_color(t.dim)
         .child(
           `${rows.length} / ${this.sessions.length} 个会话` +
-            (scope === "space" ? ` · ${context.name}` : " · 全部 Space") +
+            (scope === "space" ? ` · ${context.name}` : " · 当前 Host 全部项目") +
+            (context.machine ? ` · ${context.machine}` : "") +
             (this.updated ? ` · 更新于 ${fmtTime(Math.floor(this.updated / 1000))}` : ""),
         ),
     ];
@@ -395,9 +538,21 @@ export default class Sessions extends View {
   render(cx) {
     // 自愈：实例被复用/隐藏时定时器可能不触发，渲染时发现列表为空且
     // 不在加载中，就补一次拉取（refresh 内部有 loading 防重入）。
-    if (!this.sessions.length && !this.loading && !this.error) this.refresh(cx);
+    if (!this.updated && !this.sessions.length && !this.loading && !this.error) this.refresh(cx);
     const t = theme();
     const context = activeSpaceContext();
+    const nextContextKey = JSON.stringify({ id: context.id, machine: context.machine, roots: context.roots });
+    if (nextContextKey !== this.contextKey) {
+      this.contextKey = nextContextKey;
+      this.scanGeneration += 1;
+      this.sessions = [];
+      this.updated = 0;
+      this.currentKey = null;
+      this.error = null;
+      this.actionError = null;
+      this.refresh(cx);
+      this.refreshCurrent(cx);
+    }
     const rows = this.filtered(context);
     // popup 的 overlay.height 是上限，不会给 flex 子元素一个确定高度。
     // 若这里只用 flex_1，列表会在自然尺寸布局中收缩为 0；与内置 picker
@@ -418,6 +573,9 @@ export default class Sessions extends View {
           .overflow_y_scrollbar()
           .p(6)
           .children([
+            ...(this.actionError
+              ? [div().p(8).text_size(12).text_color(t.muted).child(this.actionError)]
+              : []),
             ...(this.error
               ? [div().p(8).text_size(12).text_color(t.muted).child(`加载失败：${this.error}`)]
               : []),
