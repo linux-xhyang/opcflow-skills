@@ -1,0 +1,11 @@
+{
+  "programs": {
+    "traex": {
+      "name": "TRAE CLI",
+      "tile": "#3b82f6",
+      "color": "#ffffff",
+      "match": ["traex", "traecli"],
+      "run": ["traex"]
+    }
+  }
+}

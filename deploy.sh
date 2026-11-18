@@ -1,14 +1,5 @@
 #!/usr/bin/env bash
-# deploy.sh — 部署 opcflow-skills 到本机（兼容 macOS 自带 bash 3.2 与 Linux bash）
-#
-# 部署内容:
-#   1. skills/           软链接到通用 skill 目录（默认 ~/.agents/skills，
-#                        可被任意 agent 读取，不绑定特定工具）
-#   2. 通用目录中的 skill 桥接到 ~/.claude/skills，供 Claude Code 加载
-#   3. config/herdr-mod/* 软链接到 herdr-app 的 mods 目录
-#   4. config/herdr-app  增量合并到 herdr-app 配置目录
-#   5. config/herdr-core 复制到 herdr-core 配置目录
-#                        默认: ${XDG_CONFIG_HOME:-~/.config}/herdr-core
+# deploy.sh — 兼容总入口：依次部署 skills 与 Herdr 配置。
 
 set -euo pipefail
 
@@ -16,259 +7,38 @@ usage() {
   cat <<EOF
 用法: $0 [选项]
 
-  无选项            部署（幂等，可重复执行）
-  -n, --dry-run     只预览将要执行的操作，不修改任何文件
-  --no-claude       不向 Claude Code 的 skill 目录建立桥接
+  无选项            依次运行 skill deploy 与 Herdr deploy
+  -n, --dry-run     只预览，不修改文件
+  --no-claude       skill deploy 不桥接到 Claude Code
+  --no-switch       Herdr deploy 后不切换到 emacs-main layout
   -h, --help        显示本帮助
 
-部署内容:
-  1. skills/*           软链接到通用 skill 目录
-                         默认: ~/.agents/skills（不绑定任何工具）
-                         覆盖: 环境变量 SKILLS_DIR
-  2. Claude 桥接         通用目录中的 skill 软链接到 ~/.claude/skills，
-                         供 Claude Code 加载；--no-claude 可跳过
-                         覆盖: 环境变量 CLAUDE_SKILLS_DIR
-  3. config/herdr-mod/* 软链接到 herdr-app 的 mods 目录
-                         默认: ~/.config/herdr-app/mods
-                         覆盖: 环境变量 HERDR_MODS_DIR
-  4. config/herdr-app   增量合并 herdr-app 快捷键配置
-                         默认: ~/.config/herdr-app/keys.json
-                         覆盖: 环境变量 HERDR_APP_HOME / HERDR_KEYS_FILE
-  5. config/herdr-core  复制到 herdr-core 配置目录
-                         默认: \${XDG_CONFIG_HOME:-~/.config}/herdr-core
-                         覆盖: 环境变量 HERDR_CONFIG_DIR
-
-兼容 macOS（自带 bash 3.2）与 Linux。
+也可以独立执行：
+  ./deploy-skills.sh [--dry-run] [--no-claude]
+  ./deploy-herdr.sh  [--dry-run] [--no-switch]
 EOF
 }
 
 DRY_RUN=0
 NO_CLAUDE=0
-case "${1:-}" in
-  "")                ;;
-  -n|--dry-run)      DRY_RUN=1 ;;
-  --no-claude)       NO_CLAUDE=1 ;;
-  -h|--help)         usage; exit 0 ;;
-  *)                 printf '未知参数: %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
-esac
+NO_SWITCH=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    --no-claude)  NO_CLAUDE=1 ;;
+    --no-switch)  NO_SWITCH=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            printf '未知参数: %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
+  esac
+  shift
+done
 
 REPO_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILLS_SRC="$REPO_DIR/skills"
-MODS_SRC="$REPO_DIR/config/herdr-mod"
-HERDR_APP_SRC="$REPO_DIR/config/herdr-app"
-HERDR_SRC="$REPO_DIR/config/herdr-core"
+SKILL_ARGS=()
+HERDR_ARGS=()
+[ "$DRY_RUN" -eq 0 ] || { SKILL_ARGS+=(--dry-run); HERDR_ARGS+=(--dry-run); }
+[ "$NO_CLAUDE" -eq 0 ] || SKILL_ARGS+=(--no-claude)
+[ "$NO_SWITCH" -eq 0 ] || HERDR_ARGS+=(--no-switch)
 
-# 通用 skill 目录（不绑定具体 agent 工具）
-SKILLS_DST="${SKILLS_DIR:-$HOME/.agents/skills}"
-# Claude Code 桥接目录（指向通用目录，便于 Claude Code 加载）
-CLAUDE_DST="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
-# herdr-app 配置与 mods 目录
-HERDR_APP_DST="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
-MODS_DST="${HERDR_MODS_DIR:-$HERDR_APP_DST/mods}"
-HERDR_KEYS_DST="${HERDR_KEYS_FILE:-$HERDR_APP_DST/keys.json}"
-# herdr-core 配置目录
-HERDR_DST="${HERDR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-core}"
-
-step() { printf '\n==> %s\n' "$*"; }
-done_() { printf '    [ok]   %s\n' "$*"; }
-skip_() { printf '    [skip] %s\n' "$*"; }
-warn() { printf '    [warn] %s\n' "$*"; }
-
-do_mkdir() { if [ "$DRY_RUN" -eq 0 ]; then mkdir -p "$1"; else printf '    mkdir -p %s\n' "$1"; fi; }
-do_rm()    { if [ "$DRY_RUN" -eq 0 ]; then rm "$1"; else printf '    rm %s\n' "$1"; fi; }
-do_ln()    { if [ "$DRY_RUN" -eq 0 ]; then ln -s "$1" "$2"; else printf '    ln -s %s %s\n' "$1" "$2"; fi; }
-do_cp()    { if [ "$DRY_RUN" -eq 0 ]; then cp -R "$1" "$2"; else printf '    cp -R %s %s\n' "$1" "$2"; fi; }
-
-# 把 $1 指向的目标统一为 $2（$1 为已存在的软链接）
-repoint() {
-  local dst="$1" target="$2"
-  [ -L "$dst" ] || return 1
-  if [ "$(readlink "$dst")" = "$target" ]; then
-    return 0            # 已指向正确目标
-  fi
-  do_rm "$dst"
-  do_ln "$target" "$dst"
-  return 2              # 已重新链接
-}
-
-# 把 $1 目录下的每个子目录链接/桥接到 $2 目录（目标为 $3 下同名路径）
-deploy_to_dir() {
-  local src_dir="$1" dst_dir="$2" target_base="$3" label="$4"
-  local src name dst target
-
-  [ -d "$dst_dir" ] || do_mkdir "$dst_dir"
-
-  for src in "$src_dir"/*/; do
-    [ -d "$src" ] || continue
-    name="${src%/}"; name="${name##*/}"
-    dst="$dst_dir/$name"
-    target="$target_base/$name"
-
-    if [ -L "$dst" ]; then
-      # 注意：必须用 if 承接 repoint 的非零返回，避免触发 set -e
-      if repoint "$dst" "$target"; then
-        skip_ "$label: $name 已链接，跳过"
-      else
-        done_ "$label: 重新链接 $name -> $dst"
-      fi
-    elif [ -e "$dst" ]; then
-      warn "$label: 跳过 $name：目标已存在且不是软链接（$dst），请手动处理"
-    else
-      do_ln "$target" "$dst"
-      done_ "$label: 链接 $name -> $dst"
-    fi
-  done
-}
-
-# ---------------------------------------------------------------- skills
-deploy_skills() {
-  step "1/5 部署 skills 到通用 skill 目录（软链接）"
-  printf '    源:   %s\n    目标: %s\n' "$SKILLS_SRC" "$SKILLS_DST"
-
-  [ -d "$SKILLS_SRC" ] || { warn "未找到 skills 目录，跳过"; return; }
-
-  local src name dst
-  for src in "$SKILLS_SRC"/*/; do
-    [ -d "$src" ] || continue
-    name="${src%/}"; name="${name##*/}"
-    [ -f "$src/SKILL.md" ] || warn "$name 缺少 SKILL.md，部分 agent 可能不会加载它"
-  done
-
-  deploy_to_dir "$SKILLS_SRC" "$SKILLS_DST" "$SKILLS_SRC" "通用"
-}
-
-# ---------------------------------------------------------------- claude 桥接
-deploy_claude_bridge() {
-  step "2/5 桥接通用 skill 到 Claude Code（软链接）"
-  printf '    源:   %s\n    目标: %s\n' "$SKILLS_DST" "$CLAUDE_DST"
-
-  [ "$NO_CLAUDE" -eq 1 ] && { skip_ "已用 --no-claude 跳过"; return; }
-  [ -d "$SKILLS_SRC" ] || { warn "未找到 skills 目录，跳过"; return; }
-  if [ "$CLAUDE_DST" = "$SKILLS_DST" ]; then
-    skip_ "Claude 桥接目录与通用目录相同，无需桥接"
-    return
-  fi
-
-  deploy_to_dir "$SKILLS_SRC" "$CLAUDE_DST" "$SKILLS_DST" "Claude"
-}
-
-# ---------------------------------------------------------------- herdr mods
-deploy_mods() {
-  step "3/5 部署 herdr mods 到 herdr-app（软链接）"
-  printf '    源:   %s\n    目标: %s\n' "$MODS_SRC" "$MODS_DST"
-
-  [ -d "$MODS_SRC" ] || { warn "未找到 config/herdr-mod 目录，跳过"; return; }
-
-  local src name dst
-  for src in "$MODS_SRC"/*/; do
-    [ -d "$src" ] || continue
-    name="${src%/}"; name="${name##*/}"
-    [ -f "$src/mod.json" ] || warn "$name 缺少 mod.json，herdr-app 可能不会加载它"
-  done
-
-  deploy_to_dir "$MODS_SRC" "$MODS_DST" "$MODS_SRC" "mod"
-}
-
-# ---------------------------------------------------------------- herdr-app
-deploy_herdr_app() {
-  local keys_src="$HERDR_APP_SRC/keys.json"
-
-  step "4/5 合并 herdr-app 快捷键配置"
-  printf '    源:   %s\n    目标: %s\n' "$keys_src" "$HERDR_KEYS_DST"
-
-  [ -f "$keys_src" ] || { warn "未找到 config/herdr-app/keys.json，跳过"; return; }
-  [ -f "$HERDR_KEYS_DST" ] || {
-    warn "未找到 $HERDR_KEYS_DST，跳过；请先启动一次 herdr-app"
-    return
-  }
-  command -v python3 >/dev/null 2>&1 || {
-    warn "未找到 python3，无法安全合并 keys.json，跳过"
-    return
-  }
-
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf '    merge-json %s -> %s（仅补充缺失项，不覆盖冲突）\n' "$keys_src" "$HERDR_KEYS_DST"
-    return
-  fi
-
-  python3 - "$keys_src" "$HERDR_KEYS_DST" <<'PY'
-import json
-import os
-import shutil
-import stat
-import sys
-import tempfile
-
-src_path, dst_path = sys.argv[1:]
-with open(src_path, encoding="utf-8") as f:
-    source = json.load(f)
-with open(dst_path, encoding="utf-8") as f:
-    target = json.load(f)
-
-added = []
-conflicts = []
-
-
-def merge_missing(dst, src, path=()):
-    for key, value in src.items():
-        key_path = path + (key,)
-        if key not in dst:
-            dst[key] = value
-            added.append(".".join(key_path))
-        elif isinstance(dst[key], dict) and isinstance(value, dict):
-            merge_missing(dst[key], value, key_path)
-        elif dst[key] != value:
-            conflicts.append(".".join(key_path))
-
-
-merge_missing(target, source)
-if added:
-    backup_path = dst_path + ".opcflow-backup"
-    shutil.copy2(dst_path, backup_path)
-    dst_dir = os.path.dirname(dst_path) or "."
-    fd, temp_path = tempfile.mkstemp(prefix=".keys.json.", dir=dst_dir)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(target, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.chmod(temp_path, stat.S_IMODE(os.stat(dst_path).st_mode))
-        os.replace(temp_path, dst_path)
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-    print("    [ok]   新增快捷键: " + ", ".join(added))
-else:
-    print("    [skip] 快捷键配置已存在")
-
-for key_path in conflicts:
-    print("    [warn] 保留已有冲突配置: " + key_path)
-PY
-}
-
-# ---------------------------------------------------------------- herdr-core
-deploy_herdr() {
-  step "5/5 部署 herdr-core 配置（复制）"
-  printf '    源:   %s\n    目标: %s\n' "$HERDR_SRC" "$HERDR_DST"
-
-  [ -d "$HERDR_SRC" ] || { warn "未找到 config/herdr-core，跳过"; return; }
-  [ -d "$HERDR_DST" ] || do_mkdir "$HERDR_DST"
-
-  for src in "$HERDR_SRC"/*; do
-    [ -e "$src" ] || continue
-    name="${src##*/}"
-    do_cp "$src" "$HERDR_DST/"
-    done_ "复制 $name"
-  done
-}
-
-# ---------------------------------------------------------------- main
-printf '部署 opcflow-skills（仓库: %s）\n' "$REPO_DIR"
-if [ "$DRY_RUN" -eq 1 ]; then
-  printf '== 预览模式（--dry-run），不会修改任何文件 ==\n'
-fi
-deploy_skills
-deploy_claude_bridge
-deploy_mods
-deploy_herdr_app
-deploy_herdr
-printf '\n完成。平台: %s / %s\n' "$(uname -s)" "$(uname -m)"
+"$REPO_DIR/deploy-skills.sh" "${SKILL_ARGS[@]}"
+"$REPO_DIR/deploy-herdr.sh" "${HERDR_ARGS[@]}"
